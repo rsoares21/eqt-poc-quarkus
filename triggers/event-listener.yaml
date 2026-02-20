@@ -1,0 +1,44 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: quarkus-ci-listener
+spec:
+  serviceAccountName: pipeline
+  triggers:
+    - name: quarkus-main-push-trigger
+      interceptors:
+        # Interceptor 1: Apenas filtra, não modifica.
+        # Continua somente se o evento for um push para a branch 'main'.
+        - name: "Filter for main branch"
+          ref:
+            name: "cel"
+          params:
+            - name: "filter"
+              value: "body.ref == 'refs/heads/main'"
+        # Interceptor 2: Apenas modifica, não filtra.
+        # Transforma o valor de 'git-revision' de 'refs/heads/main' para 'main'.
+        - name: "Extract branch name"
+          ref:
+            name: "cel"
+          params:
+            - name: "overlays"
+              value:
+                - key: git-revision
+                  expression: "body.ref.split('/')[2]"
+      bindings:
+        # O binding agora recebe o 'git-revision' já modificado.
+        - ref: quarkus-git-binding
+      template:
+        ref: quarkus-ci-triggertemplate
+---
+# Expõe o EventListener para a internet através de uma URL do OpenShift
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: quarkus-ci-listener-route
+spec:
+  to:
+    kind: Service
+    name: el-quarkus-ci-listener # O nome do serviço é 'el-' + nome do EventListener
+  port:
+    targetPort: 8080

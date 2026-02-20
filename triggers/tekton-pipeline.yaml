@@ -1,0 +1,258 @@
+# This file defines the generic Tekton Tasks and Pipeline for the CI process.
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone
+spec:
+  description: "Fast-fail clone to detect network issues quickly"
+  params:
+  - name: url
+  - name: revision
+    default: "main"
+  workspaces:
+  - name: output
+  - name: git-credentials
+    optional: true
+  results:
+    - name: commit-hash
+  steps:
+  - name: clone
+    image: bitnami/git:latest
+    script: |
+      #!/bin/bash
+      set -e
+      
+      # 1. Configurações de Timeout (15 segundos)
+      export http_proxy=""
+      export https_proxy=""
+      git config --global http.sslVerify false
+      git config --global http.lowSpeedLimit 1000
+      git config --global http.lowSpeedTime 15
+      
+      # 2. Autenticação
+      CLONE_URL="$(params.url)"
+      if [ -d "$(workspaces.git-credentials.path)" ]; then
+        if [ -f "$(workspaces.git-credentials.path)/token" ]; then
+          GIT_TOKEN=$(cat $(workspaces.git-credentials.path)/token)
+        elif [ -f "$(workspaces.git-credentials.path)/password" ]; then
+          GIT_TOKEN=$(cat $(workspaces.git-credentials.path)/password)
+        fi
+        
+        if [ ! -z "$GIT_TOKEN" ]; then
+          HOST_PATH=$(echo "$CLONE_URL" | sed -e 's|https://||')
+          CLONE_URL="https://${GIT_TOKEN}@${HOST_PATH}"
+        fi
+      fi
+
+      # 3. Clone com timeout forçado de 20s no comando
+      echo "Iniciando clone com timeout de 20s..."
+      timeout 20s git clone --depth 1 -b "$(params.revision)" "$CLONE_URL" /tmp/cloned-repo || (echo "ERRO FATAL: Conexão interrompida por timeout após 20s. Bloqueio de rede ou proxy detectado." && exit 1)
+      
+      cd /tmp/cloned-repo
+      HASH=$(git rev-parse --short HEAD)
+      echo -n "${HASH}" > "$(results.commit-hash.path)"
+      cp -r /tmp/cloned-repo/. "$(workspaces.output.path)"
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: maven-test
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: test
+      image: maven:3.9-eclipse-temurin-21
+      workingdir: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        set -ex
+        cd "$(workspaces.source.path)"
+        mvn test -Dmaven.test.skip=false
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: maven-package
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: package
+      image: maven:3.9-eclipse-temurin-21
+      workingdir: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        set -ex
+        cd "$(workspaces.source.path)"
+        mvn package -DskipTests
+        tar -cvf build.tar target src
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: openshift-start-build
+spec:
+  params:
+    - name: BUILD_CONFIG_NAME
+    - name: namespace
+  workspaces:
+    - name: source
+  steps:
+    - name: start-build
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      workingdir: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        set -ex
+        oc start-build "$(params.BUILD_CONFIG_NAME)" \
+          --from-archive="$(workspaces.source.path)/build.tar" \
+          --follow \
+          -n "$(params.namespace)"
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: quarkus-ci-pipeline
+spec:
+  workspaces:
+    - name: shared-workspace
+    - name: git-credentials
+  params:
+    - name: git-url
+      type: string
+    - name: gitops-url
+      type: string
+      default: "https://repositorio.equatorial.corp/equatorial/gmz/eqt-openshift-gitops.git"
+    - name: git-revision
+      type: string
+      default: main
+    - name: build-config-name
+      type: string
+      default: "code-with-quarkus"
+    - name: namespace
+      type: string
+  tasks:
+    - name: clone-repository
+      taskRef:
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+        - name: git-credentials
+          workspace: git-credentials
+    - name: run-tests
+      taskRef:
+        name: maven-test
+      runAfter: ["clone-repository"]
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+    - name: package-app
+      taskRef:
+        name: maven-package
+      runAfter: ["run-tests"]
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+    - name: start-openshift-build
+      taskRef:
+        name: openshift-start-build
+      runAfter: ["package-app"]
+      params:
+        - name: BUILD_CONFIG_NAME
+          value: $(params.build-config-name)
+        - name: namespace
+          value: $(params.namespace)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+    - name: tag-new-image
+      taskRef:
+        name: openshift-tag-image
+      runAfter: ["start-openshift-build"]
+      params:
+        - name: APP_NAME
+          value: $(params.build-config-name)
+        - name: NEW_TAG
+          value: $(tasks.clone-repository.results.commit-hash)
+        - name: namespace
+          value: $(params.namespace)
+    - name: update-git-repository
+      taskRef:
+        name: update-git-manifests
+      runAfter: ["tag-new-image"]
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: git-credentials
+          workspace: git-credentials
+      params:
+        - name: new_image_tag
+          value: $(tasks.clone-repository.results.commit-hash)
+        - name: git_repo_url
+          value: $(params.gitops-url)
+        - name: git_revision
+          value: $(params.git-revision)
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: openshift-tag-image
+spec:
+  params:
+    - name: APP_NAME
+    - name: NEW_TAG
+    - name: namespace
+  steps:
+    - name: tag-image
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/bin/sh
+        oc tag "${ns}/${app}:latest" "${ns}/${app}:${tag}" -n "${ns}"
+      env:
+        - name: ns
+          value: $(params.namespace)
+        - name: app
+          value: $(params.APP_NAME)
+        - name: tag
+          value: $(params.NEW_TAG)
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: update-git-manifests
+spec:
+  params:
+    - name: new_image_tag
+    - name: git_repo_url
+    - name: git_revision
+      default: main
+  workspaces:
+    - name: source
+    - name: git-credentials
+  steps:
+    - name: update-and-push
+      image: bitnami/git:latest
+      script: |
+        #!/bin/bash
+        set -ex
+        if [ -f "$(workspaces.git-credentials.path)/token" ]; then
+          GIT_TOKEN=$(cat $(workspaces.git-credentials.path)/token)
+        elif [ -f "$(workspaces.git-credentials.path)/password" ]; then
+          GIT_TOKEN=$(cat $(workspaces.git-credentials.path)/password)
+        fi
+        git config --global http.sslVerify false
+        git config --global user.email "tekton-pipeline@example.com"
+        git config --global user.name "Tekton Pipeline"
+        HOST_PATH=$(echo "$(params.git_repo_url)" | sed -e 's|https://||')
+        git clone -b "$(params.git_revision)" "https://${GIT_TOKEN}@${HOST_PATH}" .
+        sed -i "s/tag: .*/tag: \"$(params.new_image_tag)\"/" helm/values.yaml
+        git add helm/values.yaml
+        git commit --allow-empty -m "ci: Update image tag to $(params.new_image_tag)"
+        git push origin "$(params.git_revision)"

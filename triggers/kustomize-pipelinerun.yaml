@@ -1,0 +1,23 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: quarkus-ci-pipelinerun- # This name can be patched if needed
+spec:
+  pipelineRef:
+    name: quarkus-ci-pipeline
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+  params:
+    - name: image-name
+      value: "placeholder/image-name" # This will be patched
+    - name: image-tag
+      value: "latest" # This can be patched
+    - name: registry-url
+      value: "https://placeholder.registry.com" # This will be patched

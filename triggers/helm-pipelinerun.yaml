@@ -1,0 +1,29 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: quarkus-ci-pipelinerun-
+spec:
+  pipelineRef:
+    name: quarkus-ci-pipeline
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+    - name: git-credentials
+      secret:
+        secretName: git-credentials
+  params:
+    - name: git-url
+      value: "https://repositorio.equatorial.corp/equatorial/gmz/eqt-poc-quarkus.git"
+    - name: git-revision
+      value: "main"
+    - name: build-config-name
+      # ATENÇÃO: Este nome deve corresponder ao <artifactId> do seu pom.xml
+      value: "code-with-quarkus"
+    - name: namespace
+      value: "eqt-poc-quarkus-qas"
