@@ -1,0 +1,30 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: quarkus-ci-pipelinerun-
+spec:
+  pipelineRef:
+    name: quarkus-ci-pipeline
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+    - name: git-credentials
+      secret:
+        secretName: git-credentials
+  params:
+    - name: git-url
+      value: "https://github.com/rsoares21/eqt-poc-quarkus.git"
+    - name: git-revision
+      value: "homolog"
+    - name: build-config-name
+      value: "eqt-poc-quarkus"
+    - name: namespace
+      value: "eqt-poc-quarkus-hml"
+    - name: values-file
+      value: "values-hml.yaml"
